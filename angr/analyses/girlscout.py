@@ -42,7 +42,7 @@ class GirlScout(Analysis):
         self._pickle_intermediate_results = pickle_intermediate_results
         self._perform_full_code_scan = perform_full_code_scan
 
-        l.debug("Starts at 0x%08x and ends at 0x%08x.", self._start, self._end)
+        l.info("Starts at 0x%08x and ends at 0x%08x.", self._start, self._end)
 
         # Valid memory regions
         self._valid_memory_regions = sorted(
@@ -358,7 +358,7 @@ class GirlScout(Analysis):
 
                 # We log it
                 self._indirect_jumps.add((suc.scratch.jumpkind, addr))
-                l.info("IRSB 0x%x has an indirect exit %s.", addr, suc.scratch.jumpkind)
+                l.debug("IRSB 0x%x has an indirect exit %s.", addr, suc.scratch.jumpkind)
 
                 continue
 
@@ -460,13 +460,13 @@ class GirlScout(Analysis):
                     if position % self.project.arch.instruction_alignment == 0:
                         if position not in traced_address:
                             percentage = self._seg_list.occupied_size * 100.0 / (self._valid_memory_region_size)
-                            l.info("Scanning %xh, progress %0.04f%%", position, percentage)
+                            l.debug("Scanning %xh, progress %0.04f%%", position, percentage)
 
                             self._unassured_functions.add(position)
 
                             self._scan_code(traced_address, function_exits, initial_state, position)
                         else:
-                            l.info("Skipping %xh", position)
+                            l.debug("Skipping %xh", position)
 
     def _process_indirect_jumps(self):
         """
@@ -557,7 +557,7 @@ class GirlScout(Analysis):
                             if not se.symbolic(target_ip):
                                 concrete_ip = se.exactly_n_int(target_ip, 1)[0]
                                 function_starts.add(concrete_ip)
-                                l.info("Found a function address %x", concrete_ip)
+                                l.debug("Found a function address %x", concrete_ip)
 
         return function_starts
 
@@ -638,7 +638,7 @@ class GirlScout(Analysis):
 
         if self._pickle_intermediate_results and \
                 os.path.exists(dump_file_prefix + "_indirect_jumps.angr"):
-            l.debug("Loading existing intermediate results.")
+            l.info("Loading existing intermediate results.")
             self._indirect_jumps = pickle.load(open(dump_file_prefix + "_indirect_jumps.angr", "rb"))
             self.cfg = pickle.load(open(dump_file_prefix + "_coercecfg.angr", "rb"))
             self._unassured_functions = pickle.load(open(dump_file_prefix + "_unassured_functions.angr", "rb"))
@@ -648,7 +648,7 @@ class GirlScout(Analysis):
             self._scan_function_prologues(traced_address, function_exits, initial_state)
 
             if self._pickle_intermediate_results:
-                l.debug("Dumping intermediate results.")
+                l.info("Dumping intermediate results.")
                 pickle.dump(self._indirect_jumps, open(dump_file_prefix + "_indirect_jumps.angr", "wb"), -1)
                 pickle.dump(self.cfg, open(dump_file_prefix + "_coercecfg.angr", "wb"), -1)
                 pickle.dump(self._unassured_functions, open(dump_file_prefix + "_unassured_functions.angr", "wb"), -1)
@@ -663,12 +663,12 @@ class GirlScout(Analysis):
             l.info("Base address should be 0x%x", self.base_address)
 
         else:
-            l.debug("No indirect jumps are found. We switch to the slowpath mode.")
+            l.info("No indirect jumps are found. We switch to the slowpath mode.")
             # TODO: Slowpath mode...
             while True:
                 next_addr = self._get_next_code_addr(initial_state)
                 percentage = self._seg_list.occupied_size * 100.0 / (self._valid_memory_region_size)
-                l.info("Analyzing %xh, progress %0.04f%%", next_addr, percentage)
+                l.debug("Analyzing %xh, progress %0.04f%%", next_addr, percentage)
                 if next_addr is None:
                     break
 
@@ -737,7 +737,7 @@ class GirlScout(Analysis):
             pb.update(percentage * 10000)
 
             if next_addr is not None:
-                l.info("Analyzing %xh, progress %0.04f%%", next_addr, percentage)
+                l.debug("Analyzing %xh, progress %0.04f%%", next_addr, percentage)
             else:
                 l.info('No more addr to analyze. Progress %0.04f%%', percentage)
                 break
