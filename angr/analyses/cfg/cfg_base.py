@@ -565,8 +565,8 @@ class CFGBase(Analysis):
 
         if not memory_regions:
             memory_regions = [
-                (self.project.loader.main_bin.rebase_addr + start,
-                 self.project.loader.main_bin.rebase_addr + start + len(cbacker)
+                (start,
+                 start + len(cbacker)
                  )
                 for start, cbacker in self.project.loader.memory.cbackers
                 ]
