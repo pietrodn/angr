@@ -57,7 +57,7 @@ class GirlScout(Analysis):
 
         self._next_addr = self._start - 1
         # Starting point of functions
-        self.functions = None
+        self.functions = set()
         # Calls between functions
         self.call_map = networkx.DiGraph()
         # A CFG - this is not what you get from project.analyses.CFG() !
@@ -73,6 +73,7 @@ class GirlScout(Analysis):
 
         self._unassured_functions = set()
 
+        # The base address inferred from this analysis
         self.base_address = None
 
         # Start working!
@@ -210,21 +211,22 @@ class GirlScout(Analysis):
                                 concrete_addr = run.initial_state.se.any_int(addr)
                             self._read_addr_to_run[addr].append(run.addr)
 
-    def _scan_code(self, traced_addresses, function_exits, initial_state, starting_address):
-        # Saving tuples like (current_function_addr, next_exit_addr)
+    def _scan_code(self, traced_addresses, initial_state, starting_address):
+
         # Current_function_addr == -1 for exits not inside any function
-        remaining_exits = set()
         next_addr = starting_address
 
         # Initialize the remaining_exits set
-        remaining_exits.add((next_addr,
+        # Set of tuples like (current_function_addr, previous_addr, parent_addr, state)
+        self._remaining_exits = set()
+        self._remaining_exits.add((next_addr,
                              next_addr,
                              next_addr,
                              initial_state.copy()))
 
-        while len(remaining_exits):
+        while len(self._remaining_exits):
             current_function_addr, previous_addr, parent_addr, state = \
-                remaining_exits.pop()
+                self._remaining_exits.pop()
             if previous_addr in traced_addresses:
                 continue
 
@@ -238,25 +240,29 @@ class GirlScout(Analysis):
                 l.debug("Tracing new exit 0x%08x", previous_addr)
             traced_addresses.add(previous_addr)
 
-            self._scan_block(previous_addr, state, current_function_addr, function_exits, remaining_exits, traced_addresses)
+            self._scan_block(previous_addr, state, current_function_addr, traced_addresses)
 
 
-    def _scan_block(self, addr, state, current_function_addr, function_exits, remaining_exits, traced_addresses):
+    def _scan_block(self, addr, state, current_function_addr, traced_addresses):
         # Let's try to create the pyvex IRSB directly, since it's much faster
 
+        # Try to disassemble the basic block starting at addr.
         try:
             irsb = self.project.factory.block(addr).vex
-
-            # Log the size of this basic block
-            self._block_size[addr] = irsb.size
-
-            # Occupy the block
-            self._seg_list.occupy(addr, irsb.size, 'code')
         except (SimEngineError, SimMemoryError):
+            l.debug("VEX disassembly failed at 0x%08x", addr)
             return
 
+        # Log the size of this basic block
+        self._block_size[addr] = irsb.size
+
+        # Occupy the block
+        self._seg_list.occupy(addr, irsb.size, 'code')
+
         # Get all possible successors
+        # First, the successor from the block exit
         next, jumpkind = irsb.next, irsb.jumpkind
+        # Then, all the successors from other exit statements in the block
         successors = [ (i.dst, i.jumpkind) for i in irsb.statements if type(i) is pyvex.IRStmt.Exit]
         successors.append((next, jumpkind))
 
@@ -268,34 +274,35 @@ class GirlScout(Analysis):
                 next_addr = target.con.value
             else:
                 next_addr = None
+                self._indirect_jumps.add((jumpkind, addr))
+                l.debug("IRSB 0x%x has an indirect exit %s.", addr, jumpkind)
+                continue
 
-            if jumpkind == 'Ijk_Boring' and next_addr is not None:
-                remaining_exits.add((current_function_addr, next_addr,
-                                     addr, None))
+            new_state = state.copy()
+            new_state.ip = next_addr
 
-            elif jumpkind == 'Ijk_Call' and next_addr is not None:
+            if jumpkind == 'Ijk_Boring' or jumpkind == 'Ijk_Ret':
+                if current_function_addr != -1:
+                    self._remaining_exits.add((current_function_addr, next_addr, addr, new_state))
+            elif jumpkind == 'Ijk_Call':
                 # Log it before we cut the tracing :)
-                if jumpkind == "Ijk_Call":
-                    if current_function_addr != -1:
-                        self.functions.add(current_function_addr)
-                        self.functions.add(next_addr)
-                        self.call_map.add_edge(current_function_addr, next_addr)
-                    else:
-                        self.functions.add(next_addr)
-                        self.call_map.add_node(next_addr)
-                elif jumpkind == "Ijk_Boring" or \
-                                jumpkind == "Ijk_Ret":
-                    if current_function_addr != -1:
-                        function_exits[current_function_addr].add(next_addr)
+                if current_function_addr != -1:
+                    self.functions.add(current_function_addr)
+                    self.functions.add(next_addr)
+                    self.call_map.add_edge(current_function_addr, next_addr)
+                else: # Current_function_addr == -1 for exits not inside any function
+                    self.functions.add(next_addr)
+                    self.call_map.add_node(next_addr)
 
-                # If we have traced it before, don't trace it anymore
-                if next_addr in traced_addresses:
-                    return
+                self._remaining_exits.add((next_addr, next_addr, addr, new_state))
 
-                remaining_exits.add((next_addr, next_addr, addr, None))
-                l.debug("Function calls: %d", len(self.call_map.nodes()))
+            # If we have traced it before, don't trace it anymore
+            if next_addr in traced_addresses:
+                continue
 
-    def _scan_block_(self, addr, state, current_function_addr, function_exits, remaining_exits, traced_addresses):
+            l.debug("Function calls: %d", len(self.call_map.nodes()))
+
+    def _scan_block_(self, addr, state, current_function_addr, traced_addresses):
 
         # Get a basic block
         state.ip = addr
@@ -369,10 +376,9 @@ class GirlScout(Analysis):
                     self.call_map.add_edge(current_function_addr, next_addr)
                 else:
                     self.call_map.add_node(next_addr)
-            elif jumpkind == "Ijk_Boring" or \
-                            jumpkind == "Ijk_Ret":
+            elif jumpkind == "Ijk_Boring" or jumpkind == "Ijk_Ret":
                 if current_function_addr != -1:
-                    function_exits[current_function_addr].add(next_addr)
+                    self._function_exits[current_function_addr].add(next_addr)
 
             # If we have traced it before, don't trace it anymore
             if next_addr in traced_addresses:
@@ -395,7 +401,7 @@ class GirlScout(Analysis):
                 #if 20 + 16 in new_state.registers.mem:
                 #    del new_state.registers.mem[20 + 16]
                 # 0x8000000: call 0x8000045
-                remaining_exits.add((next_addr, next_addr, addr, new_state))
+                self._remaining_exits.add((next_addr, next_addr, addr, new_state))
                 l.debug("Function calls: %d", len(self.call_map.nodes()))
             elif jumpkind == "Ijk_Boring" or \
                             jumpkind == "Ijk_Ret" or \
@@ -403,7 +409,7 @@ class GirlScout(Analysis):
                 new_state = suc.copy()
                 l.debug("New exit with jumpkind %s", jumpkind)
                 # FIXME: should not use current_function_addr if jumpkind is "Ijk_Ret"
-                remaining_exits.add((current_function_addr, next_addr,
+                self._remaining_exits.add((current_function_addr, next_addr,
                                      addr, new_state))
             elif jumpkind == "Ijk_NoDecode":
                 # That's something VEX cannot decode!
@@ -428,11 +434,11 @@ class GirlScout(Analysis):
             else:
                 raise Exception("NotImplemented")
 
-    def _scan_function_prologues(self, traced_address, function_exits, initial_state):
+    def _scan_function_prologues(self, traced_address, initial_state):
         """
         Scan the entire program space for prologues, and start code scanning at those positions
         :param traced_address:
-        :param function_exits:
+        :param self._function_exits:
         :param initial_state:
         :param next_addr:
         :returns:
@@ -464,33 +470,30 @@ class GirlScout(Analysis):
 
                             self._unassured_functions.add(position)
 
-                            self._scan_code(traced_address, function_exits, initial_state, position)
+                            self._scan_code(traced_address, initial_state, position)
                         else:
                             l.debug("Skipping %xh", position)
 
     def _process_indirect_jumps(self):
         """
-        Execute each basic block with an indeterminiable exit target
+        Execute each basic block with an indeterminable exit target
         :returns:
         """
 
         function_starts = set()
-        print "We have %d indirect jumps" % len(self._indirect_jumps)
+        l.info("We have %d indirect jumps" % len(self._indirect_jumps))
 
         for jumpkind, irsb_addr in self._indirect_jumps:
             # First execute the current IRSB in concrete mode
 
-            if len(function_starts) > 20:
-                break
-
             if jumpkind == "Ijk_Call":
-                state = self.project.factory.blank_state(addr=irsb_addr, mode="concrete",
+                state = self.project.factory.blank_state(addr=irsb_addr, mode="fastpath",
                                                     add_options={simuvex.o.SYMBOLIC_INITIAL_VALUES}
                                                    )
                 path = self.project.factory.path(state)
-                print hex(irsb_addr)
 
                 try:
+                    path.step()
                     r = (path.next_run.successors + path.next_run.unsat_successors)[0]
                     ip = r.se.exactly_n_int(r.ip, 1)[0]
 
@@ -567,7 +570,7 @@ class GirlScout(Analysis):
 
         :param function_starts:
         :param functions:
-        :returns:
+        :returns: the most likely base address
         """
 
         pseudo_base_addr = self.project.loader.main_bin.get_min_addr()
@@ -610,7 +613,7 @@ class GirlScout(Analysis):
         end that there is no new function to be found.
         A function should start with:
             # some addresses that a call exit leads to, or
-            # certain instructions. They are recoreded in SimArch.
+            # certain instructions. They are stored in SimArch.
 
         For a better performance, instead of blindly scanning the entire process
         space, we first try to search for instruction patterns that a function
@@ -619,9 +622,6 @@ class GirlScout(Analysis):
         """
 
         traced_address = set()
-        self.functions = set()
-        self.call_map = networkx.DiGraph()
-        self.cfg = networkx.DiGraph()
         initial_state = self.project.factory.blank_state(mode="fastpath")
         initial_options = initial_state.options - { simuvex.o.TRACK_CONSTRAINTS } - simuvex.o.refs
         initial_options |= { simuvex.o.SUPER_FASTPATH }
@@ -632,7 +632,7 @@ class GirlScout(Analysis):
         # should record all exits from a single function, and then add
         # necessary calling edges in our call map during the post-processing
         # phase.
-        function_exits = defaultdict(set)
+        self._function_exits = defaultdict(set)
 
         dump_file_prefix = self.project.filename
 
@@ -645,7 +645,7 @@ class GirlScout(Analysis):
         else:
             # Performance boost :-)
             # Scan for existing function prologues
-            self._scan_function_prologues(traced_address, function_exits, initial_state)
+            self._scan_function_prologues(traced_address, initial_state)
 
             if self._pickle_intermediate_results:
                 l.info("Dumping intermediate results.")
@@ -660,7 +660,10 @@ class GirlScout(Analysis):
 
             self.base_address = self._solve_forbase_address(function_starts, self._unassured_functions)
 
-            l.info("Base address should be 0x%x", self.base_address)
+            if self.base_address:
+                l.info("Base address should be 0x%x", self.base_address)
+            else:
+                l.info("Couldn't infer the base address")
 
         else:
             l.info("No indirect jumps are found. We switch to the slowpath mode.")
@@ -675,11 +678,11 @@ class GirlScout(Analysis):
 
                 self.call_map.add_node(next_addr)
 
-                self._scan_code(traced_address, function_exits, initial_state, next_addr)
+                self._scan_code(traced_address, initial_state, next_addr)
 
         # Post-processing: Map those calls that are not made by call/blr
         # instructions to their targets in our map
-        for src, s in function_exits.items():
+        for src, s in self._function_exits.items():
             if src in self.call_map:
                 for target in s:
                     if target in self.call_map:
@@ -718,7 +721,7 @@ class GirlScout(Analysis):
         # should record all exits from a single function, and then add
         # necessary calling edges in our call map during the post-processing
         # phase.
-        function_exits = defaultdict(set)
+        self._function_exits = defaultdict(set)
 
         widgets = [progressbar.Percentage(),
                    ' ',
@@ -745,7 +748,7 @@ class GirlScout(Analysis):
 
             self.call_map.add_node(next_addr)
 
-            self._scan_code(traced_address, function_exits, initial_state, next_addr)
+            self._scan_code(traced_address, initial_state, next_addr)
 
         pb.finish()
         end_time = datetime.now()
